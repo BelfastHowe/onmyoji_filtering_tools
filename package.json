@@ -1,0 +1,21 @@
+{
+  "name": "onmyoji-account-library",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "import": "node app/import.ts",
+    "start": "node app/server.ts",
+    "build": "vue-tsc --noEmit && vite build",
+    "test": "node --test tests/*.test.*"
+  },
+  "dependencies": { "vue": "3.5.45" },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@vitejs/plugin-vue": "6.0.11",
+    "typescript": "5.9.3",
+    "vite": "7.3.8",
+    "vue-tsc": "3.3.14"
+  }
+}

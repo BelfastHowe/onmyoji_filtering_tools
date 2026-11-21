@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "藏宝阁筛选结果导出",
+  "version": "1.0.0",
+  "description": "从当前阴阳师藏宝阁筛选结果逐个导出账号 JSON。",
+  "permissions": ["activeTab", "scripting"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "导出当前筛选下的账号 JSON" }
+}

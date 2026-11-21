@@ -1,0 +1,150 @@
+import { mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { gzipSync } from 'node:zlib';
+import { DatabaseSync } from 'node:sqlite';
+import { decode, hash, type Listing, type Soul } from './domain.ts';
+import { analysisVersion, inventoryStats, speedAnalysis, type SpeedResult, type SetStats } from './analysis.ts';
+import { pveAnalysis } from './pve.ts';
+
+export const defaultDir = resolve(import.meta.dirname, '../account_data');
+export const defaultDB = resolve(import.meta.dirname, '../local_data/accounts.sqlite');
+export function openLibrary(path = defaultDB) {
+  if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
+  const db = new DatabaseSync(path);
+  db.exec(`
+    PRAGMA busy_timeout=15000;
+    PRAGMA foreign_keys=ON;
+    PRAGMA journal_mode=WAL;
+    CREATE TABLE IF NOT EXISTS library_state(id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL);
+    INSERT OR IGNORE INTO library_state VALUES(1,0);
+    CREATE TABLE IF NOT EXISTS listing(
+      id INTEGER PRIMARY KEY, server TEXT NOT NULL, ordersn TEXT NOT NULL, role TEXT, name TEXT NOT NULL,
+      server_name TEXT NOT NULL, url TEXT NOT NULL, price INTEGER, captured INTEGER NOT NULL,
+      current_snapshot INTEGER REFERENCES snapshot(id), UNIQUE(server,ordersn));
+    CREATE TABLE IF NOT EXISTS snapshot(
+      id INTEGER PRIMARY KEY, listing_id INTEGER NOT NULL REFERENCES listing(id), fingerprint TEXT NOT NULL,
+      souls INTEGER NOT NULL, full_souls INTEGER NOT NULL, heroes INTEGER NOT NULL, hero_data BLOB NOT NULL,
+      UNIQUE(listing_id,fingerprint));
+    CREATE TABLE IF NOT EXISTS source(
+      hash TEXT PRIMARY KEY, snapshot_id INTEGER NOT NULL REFERENCES snapshot(id), raw_gz BLOB NOT NULL);
+    CREATE TABLE IF NOT EXISTS soul(
+      snapshot_id INTEGER NOT NULL REFERENCES snapshot(id), uuid TEXT NOT NULL, suit TEXT NOT NULL,
+      pos INTEGER NOT NULL, level INTEGER NOT NULL, quality INTEGER NOT NULL, data TEXT NOT NULL,
+      PRIMARY KEY(snapshot_id,uuid)) WITHOUT ROWID;
+    CREATE INDEX IF NOT EXISTS soul_group ON soul(snapshot_id,suit,pos);
+    CREATE TABLE IF NOT EXISTS analysis(
+      snapshot_id INTEGER NOT NULL REFERENCES snapshot(id), version TEXT NOT NULL, stats TEXT NOT NULL,
+      PRIMARY KEY(snapshot_id,version));
+    CREATE TABLE IF NOT EXISTS metric(
+      snapshot_id INTEGER NOT NULL REFERENCES snapshot(id), version TEXT NOT NULL,
+      key TEXT NOT NULL, label TEXT NOT NULL, value REAL, ids TEXT NOT NULL,
+      PRIMARY KEY(snapshot_id,version,key));
+    CREATE INDEX IF NOT EXISTS metric_rank ON metric(version,key,value DESC);
+    CREATE TABLE IF NOT EXISTS batch(
+      id INTEGER PRIMARY KEY, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, version TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS member(
+      batch_id INTEGER NOT NULL REFERENCES batch(id), account_key TEXT NOT NULL, snapshot_id INTEGER NOT NULL REFERENCES snapshot(id),
+      name TEXT NOT NULL, server_name TEXT NOT NULL, url TEXT NOT NULL, price INTEGER,
+      PRIMARY KEY(batch_id,account_key));
+    CREATE VIEW IF NOT EXISTS current_member AS
+      SELECT * FROM (SELECT l.*, CASE WHEN role IS NULL THEN 'listing:'||id ELSE 'role:'||server||':'||role END AS account_key,
+        row_number() OVER (PARTITION BY server,coalesce('r:'||role,'l:'||ordersn) ORDER BY captured DESC,id DESC) AS rownum
+        FROM listing l WHERE current_snapshot IS NOT NULL) WHERE rownum=1;
+  `);
+  return db;
+}
+function atomic<T>(db: DatabaseSync, fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try { const result = fn(); db.exec('COMMIT'); return result; }
+  catch (err) { db.exec('ROLLBACK'); throw err; }
+}
+export function resetLibrary(db: DatabaseSync) {
+  atomic(db, () => db.exec(`
+    UPDATE library_state SET generation=generation+1 WHERE id=1;
+    DELETE FROM member;
+    DELETE FROM batch;
+    DELETE FROM metric;
+    DELETE FROM analysis;
+    DELETE FROM source;
+    DELETE FROM soul;
+    UPDATE listing SET current_snapshot=NULL;
+    DELETE FROM snapshot;
+    DELETE FROM listing;
+  `));
+}
+function saveAnalysis(db: DatabaseSync, snapshot: number, stats: SetStats[], speeds: SpeedResult[]) {
+  const insert = db.prepare('INSERT INTO metric VALUES(?,?,?,?,?,?)');
+  for (const m of speeds) insert.run(snapshot, analysisVersion, m.key, m.name, m.value, JSON.stringify(m.ids));
+  db.prepare('INSERT INTO analysis VALUES(?,?,?)').run(snapshot, analysisVersion, JSON.stringify(stats));
+}
+function writeListing(db: DatabaseSync, data: Listing, raw: Buffer, digest: string) {
+  const old = db.prepare('SELECT * FROM listing WHERE server=? AND ordersn=?').get(data.server,data.order);
+  const listingId = old ? Number(old.id) : Number(db.prepare(
+    'INSERT INTO listing(server,ordersn,role,name,server_name,url,price,captured) VALUES(?,?,?,?,?,?,?,?)'
+  ).run(data.server,data.order,data.role,data.name,data.serverName,data.url,data.price,data.captured).lastInsertRowid);
+  const oldSnapshot = db.prepare('SELECT id FROM snapshot WHERE listing_id=? AND fingerprint=?').get(listingId,data.fingerprint);
+  let snapshotId = Number(oldSnapshot?.id);
+  if (!oldSnapshot) {
+    snapshotId = Number(db.prepare('INSERT INTO snapshot(listing_id,fingerprint,souls,full_souls,heroes,hero_data) VALUES(?,?,?,?,?,?)')
+      .run(listingId,data.fingerprint,data.souls.length,data.souls.filter(s => s.level === 15 && s.quality === 6).length,
+        Object.keys(data.heroes).length,gzipSync(JSON.stringify(data.heroes))).lastInsertRowid);
+    const insert = db.prepare('INSERT INTO soul VALUES(?,?,?,?,?,?,?)');
+    for (const s of data.souls) insert.run(snapshotId,s.id,s.suit,s.pos,s.level,s.quality,JSON.stringify(s));
+  }
+  if (!old || data.captured >= Number(old.captured)) {
+    db.prepare('UPDATE listing SET role=coalesce(?,role),name=?,server_name=?,price=?,captured=?,current_snapshot=? WHERE id=?')
+      .run(data.role,data.name,data.serverName,data.price,data.captured,snapshotId,listingId);
+  }
+  db.prepare('INSERT INTO source VALUES(?,?,?)').run(digest,snapshotId,gzipSync(raw,{level:1}));
+  return !old ? 'added' : oldSnapshot ? 'duplicates' : 'updated';
+}
+export interface ImportReport {
+  added: number; updated: number; duplicates: number; calculated: number; batch: number;
+  errors: {file: string; message: string}[];
+}
+export function scan(db: DatabaseSync, dir = defaultDir, progress?: (value: string) => void): ImportReport {
+  // A reset from another process invalidates work started against the previous library.
+  const generation = db.prepare('SELECT generation FROM library_state WHERE id=1');
+  const started = generation.get()!.generation;
+  const interrupted = new Error('账号库已清空，本次扫描已停止');
+  function write<T>(fn: () => T): T {
+    return atomic(db, () => {
+      if (generation.get()!.generation !== started) throw interrupted;
+      return fn();
+    });
+  }
+  const report: ImportReport = { added:0, updated:0, duplicates:0, calculated:0, batch:0, errors:[] };
+  const files = readdirSync(dir,{withFileTypes:true}).filter(f=>f.isFile() && /\.json$/i.test(f.name)).map(f=>f.name).sort();
+  const known = db.prepare('SELECT 1 FROM source WHERE hash=?');
+  for (const [i,file] of files.entries()) {
+    progress?.(`读取 ${i+1}/${files.length} · ${file}`);
+    try {
+      const path = join(dir,file), raw = readFileSync(path), digest = hash(raw);
+      if (known.get(digest)) { report.duplicates++; continue; }
+      const data = decode(raw,statSync(path).mtimeMs);
+      const result = write(() => known.get(digest) ? 'duplicates' : writeListing(db,data,raw,digest));
+      report[result]++;
+    } catch (e) { if (e === interrupted) throw e; report.errors.push({file,message: e instanceof Error ? e.message : String(e)}); }
+  }
+  // Persist membership before computing: after interruption, the missing analysis rows resume on rescan.
+  report.batch = write(() => {
+    const id = Number(db.prepare('INSERT INTO batch(version) VALUES(?)').run(analysisVersion).lastInsertRowid);
+    db.prepare('INSERT INTO member SELECT ?,account_key,current_snapshot,name,server_name,url,price FROM current_member').run(id);
+    return id;
+  });
+  const missing = db.prepare(`SELECT DISTINCT m.snapshot_id FROM member m LEFT JOIN analysis a
+    ON a.snapshot_id=m.snapshot_id AND a.version=? WHERE m.batch_id=? AND a.snapshot_id IS NULL`).all(analysisVersion,report.batch);
+  for (const [index,row] of missing.entries()) {
+    const snapshot = Number(row.snapshot_id);
+    progress?.(`计算库存、一速和 PVE 预设 ${index+1}/${missing.length}`);
+    try {
+      const souls: Soul[] = db.prepare('SELECT data FROM soul WHERE snapshot_id=? ORDER BY uuid').all(snapshot).map(r=>JSON.parse(String(r.data)));
+      const stats = inventoryStats(souls), speeds = [...speedAnalysis(souls),...pveAnalysis(souls)];
+      if (write(() => {
+        if (db.prepare('SELECT 1 FROM analysis WHERE snapshot_id=? AND version=?').get(snapshot,analysisVersion)) return false;
+        saveAnalysis(db,snapshot,stats,speeds); return true;
+      })) report.calculated++;
+    } catch (e) { if (e === interrupted) throw e; report.errors.push({file:'快照 '+snapshot,message:e instanceof Error ? e.message : String(e)}); }
+  }
+  return report;
+}
