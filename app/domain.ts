@@ -1,3 +1,4 @@
+import { rollTypes } from './gearPanel.ts';
 import { createHash } from 'node:crypto';
 
 export type Pair = [string, string | number];
@@ -24,12 +25,6 @@ export function canonical(value: unknown): string {
   return JSON.stringify(value);
 }
 
-const rollTypes: Record<string, [string, number]> = {
-  speedAdditionVal: ['速度', 3], attackAdditionVal: ['攻击', 27], defenseAdditionVal: ['防御', 5],
-  maxHpAdditionVal: ['生命', 114], critRateAdditionVal: ['暴击', 3], critPowerAdditionVal: ['暴击伤害', 4],
-  maxHpAdditionRate: ['生命加成', 3], defenseAdditionRate: ['防御加成', 3], attackAdditionRate: ['攻击加成', 3],
-  debuffEnhance: ['效果命中', 4], debuffResist: ['效果抵抗', 4]
-};
 // All percentages in the local model use percentage points (15 means 15%).
 // Use the unrounded rolls only when they agree with the published two-decimal display.
 function subAttributes(display: Pair[], rolls: Pair[]) {

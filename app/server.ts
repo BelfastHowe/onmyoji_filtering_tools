@@ -10,7 +10,7 @@ const dist=resolve(import.meta.dirname,'../dist');
 const port=Number(process.env.CBG_PORT || 4317);
 let worker: Worker | undefined;
 let job: {running:boolean;message:string;report?:ImportReport}={running:false,message:''};
-const mime: Record<string,string>={'.js':'text/javascript','.css':'text/css','.html':'text/html; charset=utf-8','.svg':'image/svg+xml'};
+const mime: Record<string,string>={'.js':'text/javascript','.css':'text/css','.html':'text/html; charset=utf-8','.svg':'image/svg+xml','.png':'image/png','.webp':'image/webp'};
 const server=createServer(async (req,res)=>{
   function send(status:number, data:unknown) {
     res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});

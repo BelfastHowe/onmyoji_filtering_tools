@@ -3,8 +3,11 @@ import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import type { Soul } from '../app/domain';
 import type { SetStats } from '../app/analysis';
 import { indicators } from '../app/analysis';
+import GearWheel from './GearWheel.vue';
+import SoulDetail from './SoulDetail.vue';
+import PvePreview, { type PreviewMetric as Metric } from './PvePreview.vue';
+import { soulSets } from '../app/soulSets';
 type Row={snapshot_id:number;name:string;server_name:string;price:number|null;url:string;souls:number;full_souls:number;value:number|null;state:string};
-type Metric={key:string;label:string;value:number|null;ids:string[]};
 type Filter={key:string;min:string;max:string};
 type Catalog={counts:{accounts:number;souls:number;full:number};metrics:Metric[];batches:{id:number;created:string;accounts:number;version:string}[]};
 const catalogue=ref<Catalog>({counts:{accounts:0,souls:0,full:0},metrics:[],batches:[]});
@@ -13,21 +16,12 @@ try{saved=JSON.parse(localStorage.getItem('cbg-library/filter-v1')||'{}')??{};}c
 const metric=ref(saved.metric||'speed/loose/1'),dir=ref(saved.dir||'desc'),filters=ref<Filter[]>(Array.isArray(saved.filters)?saved.filters:[]);
 const search=ref(''),batch=ref(0),rows=ref<Row[]>([]),selected=ref<Row|null>(null),error=ref(''),message=ref(''),busy=ref(false);
 const resetDialog=ref<HTMLDialogElement|null>(null),resetting=ref(false);
+const inspected=ref<Soul|null>(null);
+const gearMessage=ref('');
 const detail=ref<{metrics:Metric[];stats:SetStats[]}>({metrics:[],stats:[]});
 const tab=ref('一速方案'),pick=ref<Metric|null>(null),gear=ref<Soul[]>([]),items=ref<Soul[]>([]),total=ref(0),offset=ref(0),suit=ref(''),pos=ref(''),dim=ref('速度');
 const activeLabel=computed(()=>catalogue.value.metrics.find(m=>m.key===metric.value)?.label||'散件一速');
 const visibleMetrics=computed(()=>detail.value.metrics.filter(m=>m.key.startsWith(tab.value==='PVE 预览'?'pve/':'speed/')));
-const bossTypes=['土蜘蛛','荒骷髅','鬼灵歌伎'];
-const damageGroups=computed(()=>{
-  const groups=new Map<string,(Metric|undefined)[]>();
-  for(const m of visibleMetrics.value){
-    const [,hero,set,boss]=m.key.split('/');
-    if(hero!=='须佐之男'||!bossTypes.includes(boss))continue;
-    const group=groups.get(set)??[];group[bossTypes.indexOf(boss)]=m;groups.set(set,group);
-  }
-  return [...groups].map(([name,cells])=>({name,cells,
-    mean:cells.reduce((sum,m)=>sum+(m?.value??0),0)/bossTypes.length}));
-});
 const number=(v:number)=>v.toLocaleString('zh-CN');
 const score=(v:number|null)=>v==null?'—':v.toFixed(2);
 let rowsRev=0,detailRev=0,gearRev=0,itemRev=0,timer:ReturnType<typeof setTimeout>|undefined;
@@ -77,13 +71,21 @@ async function selectAccount(row:Row){
   try{const version=catalogue.value.batches.find(b=>b.id===batch.value)?.version;
     const d=await get<typeof detail.value>(`/api/snapshots/${row.snapshot_id}/detail`+(version?'?version='+encodeURIComponent(version):''));
     if(rev!==detailRev)return;detail.value=d;
-    const m=d.metrics.find(m=>m.key===metric.value);if(m){tab.value=m.key.startsWith('pve/')?'PVE 预览':'一速方案';await selectGear(m);}
+    const m=d.metrics.find(m=>m.key===metric.value);
+    if(m?.key.startsWith('pve/')){tab.value='PVE 预览';pick.value=m;}
+    else if(m)await selectGear(m);
   }catch(e){if(rev===detailRev)fail(e);}
 }
 async function selectGear(m:Metric){
+  gearMessage.value='正在读取六件配装…';
   const rev=++gearRev;pick.value=m;gear.value=[];if(!m.ids.length||!selected.value)return;
   const q=new URLSearchParams();for(const id of m.ids)q.append('id',id);
-  try{const data=await get<{rows:Soul[]}>(`/api/snapshots/${selected.value.snapshot_id}/souls?${q}`);if(rev===gearRev)gear.value=data.rows;}catch(e){if(rev===gearRev)fail(e);}
+  try{
+    const data=await get<{rows:Soul[]}>(`/api/snapshots/${selected.value.snapshot_id}/souls?${q}`);
+    if(rev!==gearRev)return;
+    if(data.rows.length===6 && new Set(data.rows.map(s=>s.pos)).size===6)gear.value=data.rows;
+    else gearMessage.value='该快照缺少完整的六个位置。';
+  }catch(e){if(rev===gearRev)gearMessage.value=e instanceof Error?e.message:'配装读取失败';}
 }
 async function loadItems(){
   const rev=++itemRev;if(!selected.value||tab.value!=='御魂库存')return;
@@ -93,20 +95,20 @@ async function loadItems(){
 }
 watch([suit,pos],()=>{offset.value=0;});
 watch([tab,suit,pos,offset,selected],loadItems);
-function close(){selected.value=null;detailRev++;gearRev++;itemRev++;}
+function close(){inspected.value=null;selected.value=null;detailRev++;gearRev++;itemRev++;}
 function openTab(t:string){
   tab.value=t;
   if(['一速方案','PVE 预览'].includes(t)){
     pick.value=null;gear.value=[];gearRev++;
-    if(visibleMetrics.value.length)void selectGear(visibleMetrics.value[0]);
+    if(t==='一速方案' && visibleMetrics.value.length)void selectGear(visibleMetrics.value[0]);
   }
 }
-function escape(e:KeyboardEvent){if(e.key==='Escape')close();}
+function escape(e:KeyboardEvent){if(e.key==='Escape' && !document.querySelector('dialog[open], [popover]:popover-open'))close();}
 onMounted(async()=>{window.addEventListener('keydown',escape);try{await reload();await poll();}catch(e){fail(e);}});
 onUnmounted(()=>{clearTimeout(timer);window.removeEventListener('keydown',escape);});
 </script>
 <template>
-<header class="mast"><div class="frame"><strong>御魂账号库</strong><span>本地工作台</span></div></header>
+<header class="mast"><div class="frame"><div class="brand"><i aria-hidden="true">◈</i><strong>御魂账号库</strong></div><span>本地工作台</span></div></header>
 <main class="frame">
   <div class="title"><h1>账号总览</h1><div class="actions">
     <button class="reset-link" :disabled="busy || resetting" @click="resetDialog?.showModal()">清空数据库</button>
@@ -121,7 +123,7 @@ onUnmounted(()=>{clearTimeout(timer);window.removeEventListener('keydown',escape
   </dialog>
   <p v-if="message" role="status">{{message}}</p><p v-if="error" role="alert" class="error">{{error}}</p>
   <section class="totals" aria-label="当前库统计"><div><span>当前账号</span><strong>{{number(catalogue.counts.accounts)}}</strong></div><div><span>御魂总数</span><strong>{{number(catalogue.counts.souls)}}</strong></div><div><span>六星 +15</span><strong>{{number(catalogue.counts.full)}}</strong></div></section>
-  <div class="title"><h2>账号排行</h2><small>{{rows.length}} 个结果</small></div>
+  <section class="ranking"><div class="title"><h2>账号排行</h2><small>{{rows.length}} 个结果</small></div>
   <section class="controls"><label>搜索<input v-model="search" placeholder="账号、区服或商品编号"></label>
     <label>数据范围<select v-model.number="batch"><option :value="0">当前账号库</option><option v-for="b in catalogue.batches" :key="b.id" :value="b.id">批次 {{b.id}} · {{b.accounts}} 个账号</option></select></label>
     <label>排行指标<select v-model="metric"><option v-if="!catalogue.metrics.length" value="speed/loose/1">散件一速</option><option v-for="m in catalogue.metrics" :key="m.key" :value="m.key">{{m.label}}</option></select></label>
@@ -131,22 +133,27 @@ onUnmounted(()=>{clearTimeout(timer);window.removeEventListener('keydown',escape
   <div class="tablewrap"><table><thead><tr><th>账号 / 区服</th><th>挂牌价</th><th>御魂</th><th>六星 +15</th><th>{{activeLabel}}</th><th></th></tr></thead><tbody>
   <tr v-for="r in rows" :key="r.snapshot_id"><td><b>{{r.name}}</b><small>{{r.server_name}}</small></td><td>{{r.price===null?'—':'¥'+number(r.price/100)}}</td><td>{{number(r.souls)}}</td><td>{{number(r.full_souls)}}</td><td class="numeric">{{r.value===null?r.state:score(r.value)}}</td><td><button @click="selectAccount(r)">查看</button></td></tr></tbody></table></div>
   <p v-if="!rows.length">{{catalogue.counts.accounts?'没有符合条件的账号。':'将 JSON 放入 account_data 后，点击重新扫描。'}}</p>
+  </section>
 </main>
-<div v-if="selected" class="veil" @click.self="close"><section class="drawer" role="dialog" aria-modal="true" :aria-label="selected.name">
+<div v-if="selected" class="veil" @click.self="close"><section class="drawer" :class="{'pve-drawer':tab==='PVE 预览'}" role="dialog" aria-modal="true" :aria-label="selected.name">
   <div class="title"><div><small>{{selected.server_name}}</small><h2>{{selected.name}}</h2></div><button @click="close">关闭</button></div>
   <a :href="selected.url" target="_blank" rel="noopener noreferrer">打开藏宝阁详情 ↗</a>
   <nav><button v-for="t in ['一速方案','PVE 预览','套装统计','御魂库存']" :key="t" :class="{active:tab===t}" @click="openTab(t)">{{t}}</button></nav>
-  <div v-if="tab==='PVE 预览' && damageGroups.length" class="tablewrap"><table><thead><tr><th>须佐之男</th><th v-for="b in bossTypes">{{b}}</th><th>平均指标</th></tr></thead><tbody><tr v-for="g in damageGroups" :key="g.name"><td>{{g.name}}</td><td v-for="m in g.cells"><button v-if="m" @click="selectGear(m)">{{score(m.value)}}</button></td><td>{{score(g.mean)}}</td></tr></tbody></table></div>
-  <template v-if="['一速方案','PVE 预览'].includes(tab)"><label>查看六件配装<select :value="pick?.key" @change="selectGear(visibleMetrics.find(m=>m.key===($event.target as HTMLSelectElement).value)!)"><option v-for="m in visibleMetrics" :value="m.key" :key="m.key">{{m.label}} · {{score(m.value)}}</option></select></label>
-    <p v-if="pick?.value!=null">{{tab==='一速方案'?'御魂速度加成':'预设指标'}} <b class="numeric">{{score(pick.value)}}</b></p><p v-else>该项暂无可用组合。</p>
-    <div class="gear" v-for="s in gear" :key="s.id"><b>{{s.pos}} 号位 · {{s.suit}}</b><span>{{s.main.join(' +')}} · 速度副属性 +{{score(s.sub['速度']||0)}}</span><small>{{s.id}}</small></div>
+  <PvePreview v-if="tab==='PVE 预览'" :metrics="visibleMetrics" :selected="pick" @choose="selectGear">
+    <GearWheel v-if="pick?.value!=null && gear.length===6" :gear="gear" :metric-key="pick.key" :value="pick.value" @inspect="inspected=$event"/>
+    <p v-else-if="pick?.value!=null" role="status">{{gearMessage}}</p><p v-else>该项暂无可用组合。</p>
+  </PvePreview>
+  <template v-if="tab==='一速方案'"><label>查看六件配装<select :value="pick?.key" @change="selectGear(visibleMetrics.find(m=>m.key===($event.target as HTMLSelectElement).value)!)"><option v-for="m in visibleMetrics" :value="m.key" :key="m.key">{{m.label}} · {{score(m.value)}}</option></select></label>
+    <GearWheel v-if="pick?.value!=null && gear.length===6" :gear="gear" :metric-key="pick.key" :value="pick.value" @inspect="inspected=$event"/>
+    <p v-else-if="pick?.value!=null" role="status">{{gearMessage}}</p><p v-else>该项暂无可用组合。</p>
   </template>
   <template v-if="tab==='套装统计'"><label>各位置最高副属性<select v-model="dim"><option v-for="d in ['速度','效果命中','效果抵抗','攻击加成','生命加成','防御加成','暴击','暴击伤害']">{{d}}</option></select></label>
     <div class="tablewrap"><table><thead><tr><th>套装</th><th>件数</th><th>满速件数</th><th v-for="i in 6">{{i}} 号</th></tr></thead><tbody><tr v-for="g in detail.stats" :key="g.name"><td>{{g.name}}</td><td>{{g.count}}</td><td :title="g.fullSpeed.join(' / ')">{{g.fullSpeed.reduce((a,b)=>a+b,0)}}</td><td v-for="v in g.max[dim]">{{score(v)}}</td></tr></tbody></table></div>
   </template>
   <template v-if="tab==='御魂库存'"><div class="controls"><label>套装<select v-model="suit"><option value="">全部套装</option><option v-for="g in detail.stats">{{g.name}}</option></select></label><label>位置<select v-model="pos"><option value="">全部位置</option><option v-for="p in 6" :value="String(p)">{{p}} 号位</option></select></label></div>
-    <div class="gear" v-for="s in items" :key="s.id"><b>{{s.pos}} 号位 · {{s.suit}} · {{s.quality}} 星 +{{s.level}}</b><span>主属性 {{s.main.join(' +')}}<template v-if="s.fixed"> · 固有 {{s.fixed.join(' +')}}</template></span><span>{{Object.entries(s.sub).map(([k,v])=>k+' '+score(v)).join(' · ')}}</span><details><summary>单件指标</summary>{{Object.entries(indicators(s)).map(([k,v])=>k+' '+v).join(' · ')}}</details><small>{{s.id}}</small></div>
+    <div class="gear" v-for="s in items" :key="s.id"><button class="inventory-soul" @click="inspected=s"><img v-if="soulSets[s.suitId]" :src="soulSets[s.suitId].icon" alt="" loading="lazy">{{s.pos}} 号位 · {{s.suit}} · {{s.quality}} 星 +{{s.level}}</button><span>主属性 {{s.main.join(' +')}}<template v-if="s.fixed"> · 固有 {{s.fixed.join(' +')}}</template></span><span>{{Object.entries(s.sub).map(([k,v])=>k+' '+score(v)).join(' · ')}}</span><details><summary>单件指标</summary>{{Object.entries(indicators(s)).map(([k,v])=>k+' '+v).join(' · ')}}</details><small>{{s.id}}</small></div>
     <footer><button :disabled="offset<50" @click="offset-=50">上一页</button><span>{{total?offset+1:0}}–{{Math.min(offset+50,total)}} / {{number(total)}}</span><button :disabled="offset+50>=total" @click="offset+=50">下一页</button></footer>
   </template>
 </section></div>
+<SoulDetail v-if="selected && inspected" :soul="inspected" :equipped-count="tab==='御魂库存'?undefined:gear.filter(s=>s.suitId===inspected?.suitId).length" @close="inspected=null"/>
 </template>

@@ -1,14 +1,12 @@
+import { presetHeroes, type PresetHero as Hero } from './gearPanel.ts';
 import type { Soul } from './domain.ts';
 import type { SpeedResult } from './analysis.ts';
 
 const defenseSets=new Set(['招财猫','雪幽魂','魅妖','反枕','日女巳时','珍珠','木魅','出世螺','火之车','奉海图','雨降']);
-const fourSets=['狂骨','海月火玉','伤魂鸟','破势','隐念','镇墓兽','片叶之苇'];
-const bossSets=['土蜘蛛','荒骷髅','鬼灵歌伎'];
+export const fourSets=['狂骨','海月火玉','伤魂鸟','破势','隐念','镇墓兽','片叶之苇'];
+export const bossSets=['土蜘蛛','荒骷髅','鬼灵歌伎'];
 const attackSets=new Set(['狂骨','隐念']);
-type Hero = { name:string; atk:number; speed:number; crit:number; cd:number };
-const susano:Hero={name:'须佐之男',atk:4154,speed:112,crit:12,cd:150};
-const amaterasu:Hero={name:'天照',atk:3886,speed:119,crit:12,cd:160};
-const tamamo:Hero={name:'玉藻前',atk:3350,speed:110,crit:12,cd:160};
+const { 须佐之男:susano, 天照:amaterasu, 玉藻前:tamamo }=presetHeroes;
 const popcount=Array.from({length:64},(_,i)=>i.toString(2).replaceAll('0','').length);
 const empty=(key:string,name:string):SpeedResult=>({key,name,value:null,ids:[]});
 function stat(s:Soul,name:string) {
