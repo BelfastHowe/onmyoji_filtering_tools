@@ -5,6 +5,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { decode, hash, type Listing, type Soul } from './domain.ts';
 import { analysisVersion, inventoryStats, speedAnalysis, type SpeedResult, type SetStats } from './analysis.ts';
 import { pveAnalysis } from './pve.ts';
+import {createInventoryTables,indexInventory} from './inventoryReport.ts';
+import {migrateInventoryRatings} from './migrateInventory.ts';
 
 export const defaultDir = resolve(import.meta.dirname, '../account_data');
 export const defaultDB = resolve(import.meta.dirname, '../local_data/accounts.sqlite');
@@ -40,6 +42,15 @@ export function openLibrary(path = defaultDB) {
       key TEXT NOT NULL, label TEXT NOT NULL, value REAL, ids TEXT NOT NULL,
       PRIMARY KEY(snapshot_id,version,key));
     CREATE INDEX IF NOT EXISTS metric_rank ON metric(version,key,value DESC);
+    CREATE TABLE IF NOT EXISTS team_job(
+      id INTEGER PRIMARY KEY, snapshot_id INTEGER NOT NULL REFERENCES snapshot(id), rules TEXT NOT NULL,
+      version TEXT NOT NULL, mode TEXT NOT NULL, scene TEXT NOT NULL, template INTEGER NOT NULL,
+      config TEXT NOT NULL, status TEXT NOT NULL DEFAULT '待算', owner TEXT, result TEXT, error TEXT, elapsed INTEGER,
+      UNIQUE(snapshot_id,rules,version,mode,scene,template));
+    CREATE INDEX IF NOT EXISTS team_queue ON team_job(rules,version,mode,status,snapshot_id,id);
+    CREATE TABLE IF NOT EXISTS team_control(mode TEXT PRIMARY KEY, paused INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS team_cache(snapshot_id INTEGER NOT NULL REFERENCES snapshot(id),rules TEXT NOT NULL,
+      key TEXT NOT NULL,data BLOB NOT NULL,PRIMARY KEY(snapshot_id,rules,key)) WITHOUT ROWID;
     CREATE TABLE IF NOT EXISTS batch(
       id INTEGER PRIMARY KEY, created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, version TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS member(
@@ -51,6 +62,10 @@ export function openLibrary(path = defaultDB) {
         row_number() OVER (PARTITION BY server,coalesce('r:'||role,'l:'||ordersn) ORDER BY captured DESC,id DESC) AS rownum
         FROM listing l WHERE current_snapshot IS NOT NULL) WHERE rownum=1;
   `);
+  atomic(db, () => {
+    createInventoryTables(db);
+    if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name='piece_rating'").get()) migrateInventoryRatings(db);
+  });
   return db;
 }
 function atomic<T>(db: DatabaseSync, fn: () => T): T {
@@ -62,6 +77,11 @@ export function resetLibrary(db: DatabaseSync) {
   atomic(db, () => db.exec(`
     UPDATE library_state SET generation=generation+1 WHERE id=1;
     DELETE FROM member;
+    DELETE FROM team_job;
+    DELETE FROM team_control;
+    DELETE FROM team_cache;
+    DELETE FROM inventory_ready;
+    DELETE FROM inventory_piece;
     DELETE FROM batch;
     DELETE FROM metric;
     DELETE FROM analysis;
@@ -121,6 +141,9 @@ export function scan(db: DatabaseSync, dir = defaultDir, progress?: (value: stri
     try {
       const path = join(dir,file), raw = readFileSync(path), digest = hash(raw);
       if (known.get(digest)) { report.duplicates++; continue; }
+      if(raw.includes('"hero_equips"') && Array.isArray(JSON.parse(raw.toString('utf8').replace(/^\uFEFF/,'')).data?.hero_equips)){
+        continue; // Reference exports are read only by the comparison CLI.
+      }
       const data = decode(raw,statSync(path).mtimeMs);
       const result = write(() => known.get(digest) ? 'duplicates' : writeListing(db,data,raw,digest));
       report[result]++;
@@ -146,5 +169,7 @@ export function scan(db: DatabaseSync, dir = defaultDir, progress?: (value: stri
       })) report.calculated++;
     } catch (e) { if (e === interrupted) throw e; report.errors.push({file:'快照 '+snapshot,message:e instanceof Error ? e.message : String(e)}); }
   }
+  const unindexed=db.prepare('SELECT s.id FROM snapshot s JOIN analysis a ON a.snapshot_id=s.id AND a.version=? LEFT JOIN inventory_ready r ON r.snapshot_id=s.id WHERE r.snapshot_id IS NULL').all(analysisVersion);
+  for(const row of unindexed)write(()=>indexInventory(db,Number(row.id)));
   return report;
 }

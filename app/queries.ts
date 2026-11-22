@@ -19,6 +19,14 @@ export function accounts(db: DatabaseSync, q: URLSearchParams) {
   const args: SQLInputValue[] = bid ? [bid] : [];
   const metric = q.get('metric') || 'speed/loose/1';
   args.push(version,metric);
+  const joins:string[]=[],sorts:string[]=[];
+  for(const [i,raw] of q.getAll('then').slice(0,2).entries()){
+    const [key,dir]=JSON.parse(raw);
+    if(typeof key!=='string'||!['asc','desc'].includes(dir))throw Error('排序参数无效');
+    const alias='sort'+i;
+    joins.push(`LEFT JOIN metric ${alias} ON ${alias}.snapshot_id=b.snapshot_id AND ${alias}.version=? AND ${alias}.key=?`);
+    args.push(version,key);sorts.push(alias+'.value IS NULL,'+alias+'.value '+(dir==='asc'?'ASC':'DESC'));
+  }
   const where: string[] = [];
   if (q.get('q')) { where.push("instr(lower(b.name||' '||b.server_name||' '||b.url),lower(?))>0"); args.push(q.get('q')!); }
   for (const raw of q.getAll('filter').slice(0,12)) {
@@ -28,10 +36,18 @@ export function accounts(db: DatabaseSync, q: URLSearchParams) {
     args.push(version,key,min,min,max,max);
   }
   const direction = q.get('dir') === 'asc' ? 'ASC' : 'DESC';
+  const templates=[...new Set(q.getAll('template'))];
+  if(templates.length){
+    if(templates.length>120||templates.some(k=>!k.startsWith('team/')))throw Error('模板条件无效');
+    const flags=templates.map(()=>'?').join(',');
+    const needed=q.get('match')==='any'?1:templates.length;
+    where.push(`(SELECT count(*) FROM metric f WHERE f.snapshot_id=b.snapshot_id AND f.version=? AND f.key IN (${flags}) AND f.value=?)>=?`);
+    args.push(version,...templates,q.get('pass')==='0'?0:1,needed);
+  }
   return db.prepare(`WITH b AS (${base}) SELECT b.*,s.souls,s.full_souls,s.heroes,m.value,
     CASE WHEN m.key IS NULL THEN '未计算' WHEN m.value IS NULL THEN '无可用组合' ELSE '已完成' END AS state
     FROM b JOIN snapshot s ON s.id=b.snapshot_id LEFT JOIN metric m ON m.snapshot_id=b.snapshot_id AND m.version=? AND m.key=?
-    ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY m.value IS NULL,m.value ${direction},b.account_key`).all(...args);
+    ${joins.join(' ')} ${where.length?'WHERE '+where.join(' AND '):''} ORDER BY ${['m.value IS NULL,m.value '+direction,...sorts,'b.account_key'].join(',')}`).all(...args);
 }
 export function snapshotDetail(db: DatabaseSync,id: number,version=analysisVersion) {
   const stats = db.prepare('SELECT stats FROM analysis WHERE snapshot_id=? AND version=?').get(id,version);

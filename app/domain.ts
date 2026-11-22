@@ -58,7 +58,8 @@ export function decode(raw: Buffer, fallbackTime: number): Listing {
         !item.attrs.length || !Array.isArray(item.rattr) || !Number.isInteger(item.pos) ||
         item.pos < 1 || item.pos > 6 || !item.name || !Number.isFinite(item.suitid) ||
         !Number.isFinite(parseFloat(item.attrs[0]?.[1]))) throw new Error('御魂记录缺少有效属性或位置');
-    return { id, suit: item.name, suitId: item.suitid, pos: item.pos, quality: item.qua, level: item.level,
+    return {
+      id, suit: item.name, suitId: item.suitid, pos: item.pos, quality: item.qua, level: item.level,
       main: item.attrs[0], sub: subAttributes(item.attrs.slice(1), item.rattr),
       fixed: item.single_attr ?? null, rolls: item.rattr, wornBy: String(item.herouid ?? ''),
       locked: !!item.lock, discarded: !!item.isuseless };

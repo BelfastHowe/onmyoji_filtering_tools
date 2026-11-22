@@ -23,7 +23,7 @@ const otherPresets=[
 const rows=computed(()=>fourSets.map(set=>{
   const metrics=bossSets.map(boss=>metricsByKey.value.get(['pve','须佐之男',set,boss].join('/')));
   // A computed but infeasible preset contributes zero. An uncomputed snapshot has no mean.
-  const mean=metrics.every(m=>m!==undefined) && metrics.some(m=>m?.value!=null)
+  const mean=metrics.every(m=>m!==undefined)
     ? metrics.reduce((sum,m)=>sum+(m?.value??0),0)/metrics.length : null;
   return {set,metrics,mean};
 }));
@@ -42,9 +42,10 @@ function open(metric?:PreviewMetric){
 </script>
 <template>
   <section class="preview" aria-labelledby="preview-title">
-    <h2 id="preview-title">PVE 数据预览
+    <h2 id="preview-title">PVE 预览
       <button class="help" popovertarget="preview-help" aria-label="指标说明">?</button>
     </h2>
+    <div class="controls"><slot name="controls"/></div>
     <p id="preview-help" popover>前三列按须佐之男的满暴输出面板比较同一四件套的三种首领御魂搭配。平均值取三项指标的算术平均，已计算但无法配齐的组合按零计。点击有分数的卡片可查看六件配装。</p>
     <p v-if="!metrics.length" class="empty">此快照暂无 PVE 预设结果。</p>
     <div v-else class="sheet">
@@ -58,7 +59,7 @@ function open(metric?:PreviewMetric){
               <span><small>御魂</small>{{row.set}}</span>
               <span><small>指标</small><em>{{score(row.metrics[col]?.value)}}</em></span>
             </button>
-            <div v-else class="card average">
+            <div v-else class="card average" :class="{chosen:selected?.key==='pve/mean/'+row.set}">
               <span><small>御魂</small>{{row.set}}</span>
               <span><small>指标</small><em>{{score(row.mean)}}</em></span>
             </div>
@@ -99,7 +100,7 @@ function open(metric?:PreviewMetric){
 .card small{color:#717b89;font-size:13px}.card em{font-size:17px;font-weight:650;color:#2783dc}
 .card.average{border-color:#fbc4c4}.average em{color:#d9545c}
 button.card:hover:enabled,button.card.chosen{border-color:#86bdf1;background:#f7fbff}
-button.card:disabled{opacity:1;color:#737d87}.card:disabled em{font-style:normal;font-size:14px;color:#808892}
+.average.chosen{outline:2px solid #e4a3a5}button.card:disabled{opacity:1;color:#737d87}.card:disabled em{font-style:normal;font-size:14px;color:#808892}
 .others{border-top:2px solid #ebeef5;margin-top:36px;padding-top:18px}
 .others h3{border-bottom:2px solid #79bbff;padding:0 0 12px;margin-bottom:18px}
 .others h3::before{content:'';display:inline-block;background:#409eff;border-radius:4px;width:6px;height:18px;vertical-align:-3px;margin-right:8px}

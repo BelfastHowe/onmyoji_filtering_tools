@@ -5,8 +5,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openLibrary, resetLibrary, scan } from '../app/library.ts';
 import { decode } from '../app/domain.ts';
-import { accounts, inventory, snapshotDetail } from '../app/queries.ts';
+import { catalogue, accounts, inventory, snapshotDetail } from '../app/queries.ts';
 import { indicators, speedAnalysis, speedValue } from '../app/analysis.ts';
+import {analysisVersion} from '../app/analysis.ts';
+import {queueTeams,startTeamPool,teamProgress} from '../app/teamJobs.ts';
+import {inventoryReport} from '../app/inventoryReport.ts';
+import {rulesDir,ruleFiles} from '../app/rules.ts';
+import {existsSync} from 'node:fs';
+import {Worker} from 'node:worker_threads';
 
 function account(order='A',time='2026-11-21 12:00:00') {
   const inventory={};
@@ -112,3 +118,117 @@ test('relisting with reliable role ID; malformed file does not break remaining i
   const report=scan(db,dir);assert.equal(report.errors.length,1);
   const list=accounts(db,new URLSearchParams());assert.equal(list.length,1);assert.ok(list[0].url.endsWith('/b'));
 });
+
+test('account imports ignore legacy ratings and reference exports, retaining attribute-based inventory metrics',t=>{
+  const {db,dir,write}=fixture(t),doc=account();
+  write('account',doc);scan(db,dir);
+  Object.assign(doc.equip.equip_desc.inventory['1-0'],{score:9,zscore:14});
+  write('updated',doc);write('reference',{data:{hero_equips:[{id:'1-0',score:9,zscore:14}]}});
+  const result=scan(db,dir);
+  assert.deepEqual(result.errors,[]);assert.equal(result.calculated,0);
+  assert.equal(db.prepare('SELECT count(*) n FROM snapshot').get().n,1);
+  const view=inventoryReport(db,1,new URLSearchParams({field:'yield'}));
+  assert.equal(view.total,12);assert.equal(view.rows[0].value,1);
+  for(const field of ['score','zscore']){
+    assert.ok(!(field in view.rows[0].soul));
+    assert.throws(()=>inventoryReport(db,1,new URLSearchParams({field})),/库存指标无效/);
+  }
+});
+
+test('opening a legacy library removes ratings and keeps historical results and deduplication',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'cbg-migration-')),file=join(dir,'old.sqlite');
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  const doc=account(),input=join(dir,'account.json');
+  writeFileSync(input,JSON.stringify(doc));
+  let db=openLibrary(file);
+  const batch=scan(db,dir).batch;
+  const before=snapshotDetail(db,1);
+  db.exec(`
+    ALTER TABLE inventory_piece RENAME TO piece_rating;
+    ALTER TABLE piece_rating ADD COLUMN score REAL;
+    ALTER TABLE piece_rating ADD COLUMN zscore REAL;
+    ALTER TABLE inventory_ready RENAME TO rating_ready;
+    CREATE TABLE rating_reference(hash TEXT PRIMARY KEY,snapshot_id INTEGER);
+    INSERT INTO rating_reference VALUES('old',1);
+    UPDATE piece_rating SET score=9,zscore=14;
+    UPDATE soul SET data=json_set(data,'$.score',9,'$.zscore',14);
+    UPDATE snapshot SET fingerprint='legacy-fingerprint';
+    INSERT INTO metric SELECT snapshot_id,version,'inventory/zmax','旧指标',14,'[]' FROM analysis;
+  `);
+  db.close();
+  db=openLibrary(file);
+  try{
+    assert.deepEqual(snapshotDetail(db,1),before);
+    assert.equal(accounts(db,new URLSearchParams({batch:String(batch)}))[0].snapshot_id,1);
+    assert.ok(catalogue(db).metrics.every(m=>m.key!=='inventory/zmax'));
+    assert.equal(inventoryReport(db,1,new URLSearchParams()).total,12);
+    assert.ok(inventory(db,1,new URLSearchParams()).rows.every(s=>!('score' in s || 'zscore' in s)));
+    assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(),[]);
+    doc.equip.price++;writeFileSync(input,JSON.stringify(doc));
+    assert.equal(scan(db,dir).calculated,0);
+    assert.equal(db.prepare('SELECT count(*) n FROM snapshot').get().n,1);
+  }finally{db.close();}
+});
+
+test('multiple template filters and tie breakers use only computed results',t=>{
+  const {db,dir,write}=fixture(t);
+  for(const key of ['a','b','c'])write(key,account(key));
+  scan(db,dir);
+  const save=db.prepare("insert into metric values(?,?,?,?,?,'[]')");
+  for(const [id,a,b,n] of [[1,1,0,2],[2,1,1,3],[3,0,null,4]]){
+    for(const [key,v] of [['team/r/m/s/0',a],['team/r/m/s/1',b],['secondary/test',n]])
+      if(v!==null)save.run(id,analysisVersion,key,key,v);
+  }
+  const q=new URLSearchParams([['template','team/r/m/s/0'],['template','team/r/m/s/1'],['then',JSON.stringify(['secondary/test','desc'])]]);
+  const ids=()=>accounts(db,q).map(row=>row.snapshot_id);
+  assert.deepEqual(ids(),[2]);q.set('match','any');assert.deepEqual(ids(),[2,1]);
+  q.set('pass','0');assert.deepEqual(ids(),[3,1]);q.set('match','all');assert.deepEqual(ids(),[]);
+});
+
+test('concurrent imports of renamed duplicates survive a database reopen',async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'cbg-concurrent-')),file=join(dir,'test.sqlite');
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  const doc=JSON.stringify(account());
+  for(const name of ['source.json','renamed.json'])writeFileSync(join(dir,name),doc);
+  openLibrary(file).close();
+  const url=new URL('../app/library.ts',import.meta.url).href;
+  const code=`import {workerData,parentPort} from 'node:worker_threads';
+    import {openLibrary,scan} from ${JSON.stringify(url)};
+    const db=openLibrary(workerData.file);
+    try{parentPort.postMessage(scan(db,workerData.dir))}finally{db.close()}`;
+  const run=()=>new Promise((resolve,reject)=>{
+    const worker=new Worker(new URL('data:text/javascript,'+encodeURIComponent(code)),{workerData:{dir,file}});
+    let report;worker.on('message',r=>{report=r;});worker.on('error',reject);
+    worker.on('exit',n=>n?reject(Error('worker exit '+n)):resolve(report));
+  });
+  const results=await Promise.all([run(),run()]);
+  assert.ok(results.every(r=>!r.errors.length));
+  assert.equal(results.reduce((n,r)=>n+r.added,0),1);
+  const db=openLibrary(file);
+  try{
+    assert.equal(accounts(db,new URLSearchParams()).length,1);
+    assert.equal(db.prepare('select count(*) n from inventory_piece').get().n,12);
+    const [first,second]=results.map(r=>accounts(db,new URLSearchParams({batch:String(r.batch)})));
+    assert.deepEqual(first,second);
+    assert.ok(first[0].value>0);
+  }finally{db.close();}
+});
+
+test('paused and abandoned team jobs resume in the same database without replacing completed results',
+  {skip:Object.keys(ruleFiles).some(name=>!existsSync(join(rulesDir,name)))?'需要本地魔方规则包':false},async t=>{
+    const dir=mkdtempSync(join(tmpdir(),'cbg-workers-')),file=join(dir,'test.sqlite'),db=openLibrary(file);
+    t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
+    const doc=account();doc.equip.equip_desc.inventory={};writeFileSync(join(dir,'a.json'),JSON.stringify(doc));
+    scan(db,dir);const mode='严格快速';queueTeams(db,mode);
+    db.prepare('update team_control set paused=1 where mode=?').run(mode);
+    await startTeamPool(db,mode,1).done;
+    assert.equal(teamProgress(db,mode)[0].n,24);
+    db.exec("update team_job set status='运行中',owner='2147483647/abandoned' where id=1");
+    queueTeams(db,mode);
+    assert.equal(db.prepare('select status from team_job where id=1').get().status,'待算');
+    await startTeamPool(db,mode,2).done;
+    const results=db.prepare('select id,status,result,elapsed from team_job order by id').all();
+    assert.equal(results.length,24);assert.ok(results.every(r=>r.status==='完成'&&!JSON.parse(r.result).pass));
+    queueTeams(db,mode);await startTeamPool(db,mode,1).done;
+    assert.deepEqual(db.prepare('select id,status,result,elapsed from team_job order by id').all(),results);
+  });

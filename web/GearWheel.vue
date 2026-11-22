@@ -3,7 +3,7 @@ import { computed } from 'vue';
 import type { Soul } from '../app/domain';
 import { formatStat, gearBonuses, heroForMetric } from '../app/gearPanel';
 import { soulSets } from '../app/soulSets';
-const props=defineProps<{gear:Soul[];metricKey:string;value:number}>();
+const props=defineProps<{gear:Soul[];metricKey:string;value:number;caption?:string}>();
 defineEmits<{inspect:[soul:Soul]}>();
 const hero=computed(()=>heroForMetric(props.metricKey));
 const bonuses=computed(()=>gearBonuses(props.gear,hero.value));
@@ -13,7 +13,7 @@ const slots=computed(()=>[...props.gear].sort((a,b)=>a.pos-b.pos));
   <section class="loadout" aria-label="六件配装">
     <div class="wheel">
       <div class="wheel-rim" aria-hidden="true"></div>
-      <div class="wheel-score"><span>{{hero?.name || '速度加成'}}</span><strong>{{value.toFixed(2)}}</strong></div>
+      <div class="wheel-score"><span>{{caption || hero?.name || '速度加成'}}</span><strong>{{value.toFixed(2)}}</strong></div>
       <button v-for="s in slots" :key="s.id" class="soul-slot" :class="'slot-'+s.pos"
         :aria-label="s.pos+'号位 '+s.suit+'，查看御魂详情'" @click="$emit('inspect',s)">
         <span class="emblem">
