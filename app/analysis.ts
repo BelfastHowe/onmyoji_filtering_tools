@@ -1,7 +1,7 @@
 import type { Soul } from './domain.ts';
 
 export const analysisVersion = 'inventory-speed-pve-v2';
-export const hitSets = ['招财猫','火灵','遗念火','油赤子','共潜','蚌精','返魂香','魅妖','钟灵','雪幽魂'];
+const hitSets = ['招财猫','火灵','遗念火','油赤子','共潜','蚌精','返魂香','魅妖','钟灵','雪幽魂'];
 export const dimensions = ['速度','效果命中','效果抵抗','攻击加成','生命加成','防御加成','暴击','暴击伤害'];
 export function indicators(s: Soul) {
   const sub=(key:string)=>s.sub[key]??0;

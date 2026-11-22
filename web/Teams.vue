@@ -4,11 +4,13 @@ import type {Template,TeamResult,MemberResult} from '../app/teamEngine';
 import type {Soul} from '../app/domain';
 import GearWheel from './GearWheel.vue';
 import SoulDetail from './SoulDetail.vue';
-const props=defineProps<{snapshot?:number;version?:string;initialScene?:string;initialIndex?:number;initialMode?:string}>();
+const props=defineProps<{snapshot?:number;version?:string;initialScene?:string;initialIndex?:number;initialMode?:string;refreshToken?:number}>();
 const emit=defineEmits<{refresh:[]}>();
 type Entry={status:string;config:Template;result:(TeamResult&{missing:string[]})|null;error:string|null;elapsed:number|null};
 const mode=ref(props.initialMode||'严格快速'),scene=ref(props.initialScene||'魂土'),state=ref('全部'),entries=ref<Entry[]>([]);
 const progress=ref<{status:string;n:number}[]>([]),paused=ref(false),error=ref(''),working=ref(false),expanded=ref<number|undefined>(props.initialIndex);
+const overall=ref<{total:number;done:number;active:number}>();
+const cpu=ref<{physical:number|null;logical:number;available:number}>(),threads=ref(0),canCalculate=ref(false);
 const filtered=computed(()=>entries.value.filter(r=>r.config.scene===scene.value && (state.value==='全部'||state.value===status(r))));
 const scenes=computed(()=>Array.from(new Set(entries.value.map(r=>r.config.scene))));
 const member=ref<MemberResult>(),gear=ref<Soul[]>([]),dialog=ref<HTMLDialogElement>(),piece=ref<Soul|null>(null),gearError=ref('');
@@ -19,18 +21,24 @@ async function refresh(){
   const id=++generation;clearTimeout(timer);
   try{
     const q=new URLSearchParams({mode:mode.value});if(props.version)q.set('version',props.version);
+    if(props.snapshot)q.set('snapshot',String(props.snapshot));else q.set('overall','1');
     const [p,items]=await Promise.all([request('/api/teams?'+q),props.snapshot?request('/api/snapshots/'+props.snapshot+'/teams?'+q):Promise.resolve([])]);
     if(id!==generation)return;
     progress.value=p.rows;paused.value=p.paused;error.value=p.error;entries.value=items;
-    const done=Number(p.rows.find((r:{status:string})=>r.status==='完成')?.n||0);
+    overall.value=p.overall;
+    cpu.value=p.cpu;threads.value=p.threads;canCalculate.value=p.canCalculate;
+    const done=Number(p.overall?.done??p.rows.find((r:{status:string})=>r.status==='完成')?.n??0);
     if(previousDone>=0 && previousDone!==done && !props.snapshot)emit('refresh');
     previousDone=done;
-    if(p.rows.some((r:{status:string})=>r.status==='运行中'||(!p.paused && r.status==='待算')))timer=setTimeout(refresh,3500);
+    if(p.overall?.active||p.rows.some((r:{status:string})=>r.status==='运行中'||(!p.paused && r.status==='待算')))timer=setTimeout(refresh,3500);
   }catch(e){if(id===generation)error.value=String(e);}
 }
 async function action(action:string){
   working.value=true;
-  try{await request('/api/teams?'+new URLSearchParams({action,mode:mode.value}),true);await refresh();}catch(e){error.value=String(e);}finally{working.value=false;}
+  const q=new URLSearchParams({action,mode:mode.value});
+  if(props.snapshot)q.set('snapshot',String(props.snapshot));
+  if(props.version)q.set('version',props.version);
+  try{await request('/api/teams?'+q,true);await refresh();}catch(e){error.value=String(e);}finally{working.value=false;}
 }
 async function showGear(m:MemberResult){
   const id=++rev;member.value=m;gear.value=[];gearError.value='';dialog.value?.showModal();
@@ -41,19 +49,22 @@ async function showGear(m:MemberResult){
 }
 watch([mode,()=>props.snapshot,()=>props.version],()=>{expanded.value=undefined;void refresh();});
 onMounted(refresh);
+watch(()=>props.refreshToken,refresh);
 onUnmounted(()=>{generation++;rev++;clearTimeout(timer);});
 </script>
 <template>
   <section class="teams">
     <div class="controls"><label>阵容计算模式<select v-model="mode"><option v-for="m in ['严格快速','宽容快速','严格精确','宽容精确']" :key="m">{{m}}</option></select></label>
-      <template v-if="!snapshot"><button :disabled="working" @click="action('start')">批量计算 / 续算</button><button :disabled="working" @click="action('pause')">暂停</button></template>
-      <template v-else><label>模板状态<select v-model="state"><option v-for="s in ['全部','达标','未达标','待算','运行中','出错']" :key="s">{{s}}</option></select></label></template>
+      <button class="primary" :disabled="working||!canCalculate" @click="action('start')">{{snapshot?'计算当前账号':'计算全部当前账号'}}</button>
+      <button v-if="!snapshot" :disabled="working||paused" @click="action('pause')">暂停此模式</button>
+      <label v-else>模板状态<select v-model="state"><option v-for="s in ['全部','达标','未达标','待算','运行中','已暂停','出错']" :key="s">{{s}}</option></select></label>
       <button @click="refresh">刷新</button>
     </div>
+    <small v-if="cpu && !snapshot">CPU · <template v-if="cpu.physical">{{cpu.physical}} 核 / </template>{{cpu.logical}} 线程 · 可用 {{cpu.available}} 线程<template v-if="threads"> · 当前模式使用 {{threads}} 个工作线程</template></small>
     <div v-if="snapshot && scenes.length" class="segments" aria-label="选择副本"><button v-for="s in scenes" :key="s" :aria-pressed="scene===s" @click="scene=s;expanded=undefined">{{s}}</button></div>
     <p v-if="error" role="alert" class="error">{{error}}</p>
-    <p v-if="!snapshot" role="status">{{paused?'已暂停 · ':''}}{{progress.map(p=>p.status+' '+p.n).join(' · ')||'尚未提交批量阵容任务'}}</p>
-    <p v-else-if="!filtered.length">{{entries.length?'没有符合条件的模板。':'此快照在该规则和模式下暂无结果，可从总览启动批量阵容计算。'}}</p>
+    <p v-if="!snapshot" role="status"><template v-if="overall?.total">全部模式已完成 {{overall.done}} / {{overall.total}} · </template>{{mode}} · {{paused?'已暂停 · ':''}}{{progress.map(p=>p.status+' '+p.n).join(' · ')||'暂无任务'}}</p>
+    <p v-else-if="!filtered.length">{{entries.length?'没有符合条件的模板。':canCalculate?'此账号尚无该模式的结果。选择模式后点击「计算当前账号」。':'该历史版本暂无阵容结果。'}}</p>
     <article v-for="r in filtered" :key="r.config.scene+r.config.index">
       <button class="row" :aria-expanded="expanded===r.config.index" @click="expanded=expanded===r.config.index?undefined:r.config.index">
         <span>#{{r.config.index+1}}　{{r.config.name}}</span><strong :class="r.result?(r.result.pass?'pass':'miss'):''">{{status(r)}}</strong>

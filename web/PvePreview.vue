@@ -13,6 +13,7 @@ const props=defineProps<{metrics:PreviewMetric[]; selected:PreviewMetric|null}>(
 const emit=defineEmits<{choose:[metric:PreviewMetric]}>();
 const dialog=ref<HTMLDialogElement>();
 const metricsByKey=computed(()=>new Map(props.metrics.map(m=>[m.key,m])));
+const overall=computed(()=>metricsByKey.value.get('pve/mean/须佐之男')?.value);
 const otherPresets=[
   {key:'pve/天照/狂骨/鬼灵歌伎',set:'狂骨 + 鬼灵歌伎',hero:'魂土天照',unit:'damage'},
   {key:'pve/玉藻前/破势/荒骷髅',set:'破势 + 荒骷髅',hero:'超星玉藻前',unit:'damage'},
@@ -46,9 +47,10 @@ function open(metric?:PreviewMetric){
       <button class="help" popovertarget="preview-help" aria-label="指标说明">?</button>
     </h2>
     <div class="controls"><slot name="controls"/></div>
-    <p id="preview-help" popover>前三列按须佐之男的满暴输出面板比较同一四件套的三种首领御魂搭配。平均值取三项指标的算术平均，已计算但无法配齐的组合按零计。点击有分数的卡片可查看六件配装。</p>
+    <p id="preview-help" popover>每行比较同一四件套的三种首领搭配。行平均取这三项的均值，总体平均取当前模式全部 21 项的均值。无法配齐的组合计 0，缺少计算结果时暂不显示均分。点击有分数的搭配可查看六件御魂。</p>
     <p v-if="!metrics.length" class="empty">此快照暂无 PVE 预设结果。</p>
     <div v-else class="sheet">
+      <div class="overall"><h3>须佐之男 · 21项平均分</h3><strong>{{overall==null?'待计算':overall.toFixed(2)}}</strong></div>
       <div class="matrix" aria-label="须佐之男首领御魂对比">
         <section v-for="(boss,col) in [...bossSets,'平均值']" :key="boss" class="column" :class="'col-'+col" :aria-label="boss">
           <h3>{{boss}}</h3>
@@ -91,6 +93,7 @@ function open(metric?:PreviewMetric){
 .help{display:inline-grid;place-items:center;vertical-align:middle;margin-left:3px;border:0;border-radius:50%;width:16px;height:16px;padding:0;font:bold 12px/1 system-ui;background:#606266;color:white}
 #preview-help{max-width:min(360px,88vw);padding:16px;border:1px solid #dcdfe6;border-radius:7px;box-shadow:0 4px 20px #24334a20;color:#37465b}
 .sheet{background:#fff;border:1px solid #f1f2f4;border-radius:9px;box-shadow:0 2px 12px #00000012;padding:clamp(12px,1.5vw,20px)}
+.overall{display:flex;align-items:baseline;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:18px;padding:12px 16px;background:#fef5f4;border-radius:7px;color:#9b4148}.overall h3{font-size:16px;margin:0}.overall strong{font-size:24px;font-variant-numeric:tabular-nums}
 .matrix,.other-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:clamp(10px,1.5vw,20px)}
 .column{display:grid;gap:clamp(10px,1.5vw,20px);min-width:0}
 .column h3{padding:16px 4px;text-align:center;font-size:16px;border:1px solid var(--edge);border-radius:7px 7px 0 0;background:var(--tint);color:var(--ink);box-shadow:0 2px 4px #0000000c}

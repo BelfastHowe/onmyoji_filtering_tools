@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { openLibrary, resetLibrary, scan } from '../app/library.ts';
+import { indexPending, openLibrary, resetLibrary, scan, scanSources } from '../app/library.ts';
+import {runSnapshotWorkers} from '../app/parallelism.ts';
 import { decode } from '../app/domain.ts';
 import { catalogue, accounts, inventory, snapshotDetail } from '../app/queries.ts';
 import { indicators, speedAnalysis, speedValue } from '../app/analysis.ts';
 import {analysisVersion} from '../app/analysis.ts';
-import {queueTeams,startTeamPool,teamProgress} from '../app/teamJobs.ts';
+import {completedTeamModes,pauseTeamMode,queueTeams,startTeamPool,teamProgress} from '../app/teamJobs.ts';
+import {fillQuickPreviews} from '../app/previewJobs.ts';
+import {backfillSusanoMeans} from '../app/pveMean.ts';
+import {fourSets,bossSets} from '../app/pve.ts';
 import {inventoryReport} from '../app/inventoryReport.ts';
 import {rulesDir,ruleFiles} from '../app/rules.ts';
 import {existsSync} from 'node:fs';
@@ -31,6 +35,95 @@ function fixture(t) {
   function write(file, value){writeFileSync(join(dir,file+'.json'),JSON.stringify(value));}
   return {db,dir,write};
 }
+
+test('Susano means use 21 exact presets per mode and version; historical rankings and range filters use the stored mean',t=>{
+  const {db,dir,write}=fixture(t);
+  write('a',account());scan(db,dir);
+  const prefix='pve-fast/old-rules/',key=prefix+'mean/须佐之男';
+  const put=db.prepare("INSERT INTO metric VALUES(1,?,?,?,?,'[]')");
+  const keys=fourSets.flatMap(set=>bossSets.map(b=>prefix+'须佐之男/'+set+'/'+b));
+  keys.forEach((k,i)=>{
+    put.run(analysisVersion,k,'快速',i===20?null:i+0.125);
+    if(i>0)put.run('incomplete',k,'旧版本',100);
+  });
+  put.run(analysisVersion,prefix+'天照/狂骨/鬼灵歌伎','其他预设',90000);
+  db.exec('PRAGMA user_version=0');backfillSusanoMeans(db);
+  const expected=(190+20*0.125)/21;
+  assert.equal(db.prepare('SELECT value FROM metric WHERE key=? AND version=?').get(key,analysisVersion).value,expected);
+  assert.equal(db.prepare('SELECT value FROM metric WHERE key=? AND version=?').get(key,'incomplete'),undefined);
+  assert.equal(db.prepare("SELECT value FROM metric WHERE key='pve/mean/须佐之男'").get().value,0);
+  assert.ok(catalogue(db).metrics.slice(0,2).every(m=>m.key.endsWith('/mean/须佐之男')));
+  const query=new URLSearchParams({metric:key,batch:'1',filter:JSON.stringify([key,expected,expected])});
+  assert.deepEqual(accounts(db,query).map(r=>r.value),[expected]);
+  query.set('filter',JSON.stringify([key,expected+1,null]));
+  assert.deepEqual(accounts(db,query),[]);
+});
+
+test('manual snapshot and batch runs unlock each complete mode independently in the selected scope',
+  {skip:Object.keys(ruleFiles).some(name=>!existsSync(join(rulesDir,name)))},async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'cbg-manual-')),file=join(dir,'test.sqlite');
+  let db=openLibrary(file);
+  t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
+  function add(order){const doc=account(order);doc.equip.equip_desc.inventory={};writeFileSync(join(dir,order+'.json'),JSON.stringify(doc));}
+  add('A');const a=scan(db,dir);
+  add('B');scan(db,dir);
+  assert.equal(db.prepare('SELECT count(*) n FROM team_job').get().n,0);
+  const mode='严格快速';
+  queueTeams(db,mode,true,1);await startTeamPool(db,mode,2).done;
+  assert.equal(teamProgress(db,mode,2).length,0);
+  assert.deepEqual(completedTeamModes(db,0),[]);
+  assert.equal(completedTeamModes(db,a.batch).length,1);
+  queueTeams(db,mode,true);await startTeamPool(db,mode,2).done;
+  assert.equal(completedTeamModes(db,0).length,1);
+  assert.equal(teamProgress(db,mode)[0].n,48);
+  const second='宽容快速';
+  queueTeams(db,second);pauseTeamMode(db,second);
+  queueTeams(db,second,true,2);await startTeamPool(db,second,1).done;
+  assert.equal(teamProgress(db,second,1)[0].status,'已暂停');
+  assert.equal(teamProgress(db,second,2)[0].status,'完成');
+  add('C');scan(db,dir);
+  assert.equal(teamProgress(db,mode,3).length,0);
+  assert.equal(completedTeamModes(db,0).length,0);
+  queueTeams(db,mode);
+  db.exec('PRAGMA user_version=1');db.close();db=openLibrary(file);
+  assert.equal(teamProgress(db,mode,3)[0].status,'已暂停');
+  assert.equal(teamProgress(db,mode,1)[0].status,'完成');
+});
+
+test('parallel base analysis reproduces serial metrics and rejects work claimed before a reset',async t=>{
+  const {db:serial,dir,write}=fixture(t);
+  write('a',account('A'));write('b',account('B'));scan(serial,dir);
+  const file=join(dir,'parallel.db'),parallel=openLibrary(file);
+  try{
+    const {ids,epoch}=scanSources(parallel,dir);
+    const worker=new URL('../app/analysisWorker.ts',import.meta.url);
+    const completed=[];
+    await runSnapshotWorkers(worker,file,ids,epoch,2,r=>completed.push(r));
+    assert.deepEqual(completed,[{calculated:1},{calculated:1}]);
+    indexPending(parallel,epoch);
+    const metrics='SELECT * FROM metric ORDER BY snapshot_id,version,key';
+    assert.deepEqual(parallel.prepare(metrics).all(),serial.prepare(metrics).all());
+    resetLibrary(parallel);
+    await assert.rejects(runSnapshotWorkers(worker,file,ids,epoch,2,()=>{}),/本次扫描已停止/);
+    assert.equal(parallel.prepare('SELECT count(*) n FROM metric').get().n,0);
+  }finally{parallel.close();}
+});
+
+test('parallel quick previews match serial scores and IDs, then skip completed snapshots',
+  {skip:Object.keys(ruleFiles).some(name=>!existsSync(join(rulesDir,name)))},async t=>{
+  const dir=mkdtempSync(join(tmpdir(),'cbg-pve-workers-')),db=openLibrary(join(dir,'db.sqlite'));
+  t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
+  for(const id of ['A','B'])writeFileSync(join(dir,id+'.json'),JSON.stringify(account(id)));
+  scan(db,dir);
+  const results=()=>db.prepare("SELECT * FROM metric WHERE key LIKE 'pve-fast/%' ORDER BY snapshot_id,key").all();
+  await fillQuickPreviews(db,undefined,1);
+  const expected=results();
+  assert.equal(expected.length,68);
+  db.exec("DELETE FROM metric WHERE key LIKE 'pve-fast/%'");
+  await fillQuickPreviews(db,undefined,2);
+  assert.deepEqual(results(),expected);
+  await fillQuickPreviews(db,()=>assert.fail('completed snapshots were scheduled'),2);
+});
 test('effective rolls preserve detail precision; exceptional gift uses its displayed value',()=>{
   const doc=account();const soul=doc.equip.equip_desc.inventory['1-0'];
   soul.attrs[1][1]='2.67';soul.rattr[0][1]=0.891;

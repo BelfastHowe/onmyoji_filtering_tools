@@ -4,7 +4,7 @@ import { analysisVersion } from './analysis.ts';
 export function catalogue(db: DatabaseSync) {
   return {
     batches: db.prepare('SELECT b.*,count(m.snapshot_id) AS accounts FROM batch b LEFT JOIN member m ON m.batch_id=b.id GROUP BY b.id ORDER BY b.id DESC').all(),
-    metrics: db.prepare('SELECT key,min(label) AS label FROM metric GROUP BY key ORDER BY key').all(),
+    metrics: db.prepare("SELECT key,min(label) AS label FROM metric GROUP BY key ORDER BY (key LIKE '%/mean/须佐之男') DESC,key").all(),
     counts: db.prepare(`SELECT count(*) AS accounts,coalesce(sum(s.souls),0) AS souls,coalesce(sum(s.full_souls),0) AS full
       FROM current_member l JOIN snapshot s ON s.id=l.current_snapshot`).get()
   };

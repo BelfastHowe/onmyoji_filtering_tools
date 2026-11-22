@@ -6,6 +6,7 @@ import {analysisVersion} from './analysis.ts';
 import {rulesVersion} from './rules.ts';
 import {createTeamEngine,type Template,type TeamResult} from './teamEngine.ts';
 import type {Soul} from './domain.ts';
+import {workerLimit} from './parallelism.ts';
 
 export const teamModes=['严格快速','宽容快速','严格精确','宽容精确'] as const;
 export type TeamMode=(typeof teamModes)[number];
@@ -17,38 +18,69 @@ function transaction<T>(db:DatabaseSync,fn:()=>T){
   db.exec('BEGIN IMMEDIATE');
   try{const result=fn();db.exec('COMMIT');return result;}catch(e){db.exec('ROLLBACK');throw e;}
 }
-export function teamProgress(db:DatabaseSync,mode:TeamMode){
-  return db.prepare(`SELECT j.status,count(*) AS n FROM team_job j
-    JOIN current_member c ON c.current_snapshot=j.snapshot_id WHERE j.version=? AND j.rules=? AND j.mode=? GROUP BY j.status`)
-    .all(analysisVersion,rulesVersion,mode);
+export function teamProgress(db:DatabaseSync,mode:TeamMode,snapshot?:number,version=analysisVersion){
+  return db.prepare(`SELECT status,count(*) AS n FROM team_job WHERE version=? AND rules=? AND mode=?
+    ${snapshot===undefined?'':'AND snapshot_id=?'} GROUP BY status`).all(version,rulesVersion,mode,...(snapshot===undefined?[]:[snapshot]));
+}
+export function overallTeamProgress(db:DatabaseSync){
+  return db.prepare(`SELECT count(*) AS total,count(*) FILTER (WHERE j.status='完成') AS done,
+    count(*) FILTER (WHERE j.status='运行中' OR (j.status='待算' AND t.paused=0)) AS active
+    FROM team_job j
+    JOIN team_control t ON t.mode=j.mode WHERE j.version=? AND j.rules=?`).get(analysisVersion,rulesVersion);
 }
 let templateCatalogue:Template[]|undefined;
-export function queueTeams(db:DatabaseSync,mode:TeamMode,retry=false){
+export function completedTeamModes(db:DatabaseSync,batch:number){
+  const scope=batch?'SELECT DISTINCT snapshot_id FROM member WHERE batch_id=?':'SELECT DISTINCT current_snapshot AS snapshot_id FROM current_member';
+  const version=batch?db.prepare('SELECT version FROM batch WHERE id=?').get(batch)?.version:analysisVersion;
+  if(!version)return [];
+  const groups=db.prepare(`WITH scope AS (${scope}) SELECT mode,count(*) AS done,(SELECT count(*) FROM scope) AS accounts
+    FROM team_job j JOIN scope USING(snapshot_id) WHERE version=? AND rules=? AND status='完成' GROUP BY mode`)
+    .all(...(batch?[batch]:[]),version,rulesVersion);
+  if(!groups.length)return [];
+  const templates=templateCatalogue??=createTeamEngine().templates;
+  return groups.filter(r=>Number(r.done)===Number(r.accounts)*templates.length).map(r=>'team/'+rulesVersion+'/'+r.mode+'/');
+}
+export function pauseTeamMode(db:DatabaseSync,mode:TeamMode){
+  transaction(db,()=>{
+    db.prepare('INSERT OR REPLACE INTO team_control VALUES(?,1)').run(mode);
+    db.prepare("UPDATE team_job SET status='已暂停',owner=NULL WHERE rules=? AND version=? AND mode=? AND status IN ('待算','运行中')").run(rulesVersion,analysisVersion,mode);
+  });
+}
+export function recoverTeamWorkers(db:DatabaseSync){
+  for(const {owner} of db.prepare("SELECT DISTINCT owner FROM team_job WHERE status='运行中'").all()){
+    const pid=Number(String(owner).split('/')[0]);
+    try{process.kill(pid,0);}catch(e){
+      if((e as NodeJS.ErrnoException).code==='ESRCH')release(db,String(owner));
+    }
+  }
+}
+export function queueTeams(db:DatabaseSync,mode:TeamMode,retry=false,snapshot?:number){
   const templates=templateCatalogue??=createTeamEngine().templates;
   transaction(db,()=>{
+    recoverTeamWorkers(db);
+    if(snapshot!==undefined&&!db.prepare('SELECT 1 FROM snapshot WHERE id=?').get(snapshot))throw Error('账号快照不存在');
+    const scope=snapshot===undefined?'SELECT current_snapshot FROM current_member':'SELECT id FROM snapshot WHERE id=?';
+    const params=snapshot===undefined?[]:[snapshot];
     db.prepare('INSERT OR REPLACE INTO team_control VALUES(?,0)').run(mode);
     const insert=db.prepare(`INSERT OR IGNORE INTO team_job(snapshot_id,rules,version,mode,scene,template,config)
-      SELECT current_snapshot,?,?,?,?,?,? FROM current_member`);
-    for(const t of templates)insert.run(rulesVersion,analysisVersion,mode,t.scene,t.index,JSON.stringify(t));
-    if(retry)db.prepare("UPDATE team_job SET status='待算',error=NULL WHERE status='出错' AND rules=? AND version=? AND mode=?").run(rulesVersion,analysisVersion,mode);
-    for(const {owner} of db.prepare("SELECT DISTINCT owner FROM team_job WHERE status='运行中'").all()){
-      const pid=Number(String(owner).split('/')[0]);
-      try{process.kill(pid,0);}catch(e){
-        if((e as NodeJS.ErrnoException).code==='ESRCH')release(db,String(owner));
-      }
-    }
+      SELECT id,?,?,?,?,?,? FROM snapshot WHERE id IN (${scope})`);
+    for(const t of templates)insert.run(rulesVersion,analysisVersion,mode,t.scene,t.index,JSON.stringify(t),...params);
+    db.prepare(`UPDATE team_job SET status='待算',error=NULL WHERE status IN ('已暂停'${retry?",'出错'":''})
+      AND rules=? AND version=? AND mode=? AND snapshot_id IN (${scope})`).run(rulesVersion,analysisVersion,mode,...params);
   });
 }
 function release(db:DatabaseSync,owner:string){
-  db.prepare("UPDATE team_job SET status='待算',owner=NULL WHERE owner=? AND status='运行中'").run(owner);
+  db.prepare(`UPDATE team_job SET status=CASE WHEN (SELECT paused FROM team_control WHERE mode=team_job.mode)=1
+    THEN '已暂停' ELSE '待算' END,owner=NULL WHERE owner=? AND status='运行中'`).run(owner);
 }
-export function startTeamPool(db:DatabaseSync,mode:TeamMode,concurrency=4){
+export function startTeamPool(db:DatabaseSync,mode:TeamMode,concurrency=workerLimit(mode.endsWith('精确')?1024:768)){
   const database=db.location();
   if(!database)throw Error('阵容工作线程需要磁盘数据库');
   const workers=new Set<Worker>();
   const finished:Promise<void>[]=[];
   let failure='';
-  for(let i=0;i<concurrency;i++){
+  const pending=Number(teamProgress(db,mode).find(r=>r.status==='待算')?.n??0);
+  for(let i=0;i<Math.min(concurrency,pending);i++){
     const owner=process.pid+'/'+randomUUID();
     const worker=new Worker(new URL('./teamWorker.ts',import.meta.url),{workerData:{owner,mode,database}});
     workers.add(worker);
@@ -58,7 +90,7 @@ export function startTeamPool(db:DatabaseSync,mode:TeamMode,concurrency=4){
     })));
   }
   const done=Promise.all(finished).then(()=>{if(failure)throw Error(failure);});
-  return {done,pause:()=>Promise.all([...workers].map(w=>w.terminate())).then(()=>done)};
+  return {done,get threads(){return workers.size;},pause:()=>Promise.all([...workers].map(w=>w.terminate())).then(()=>done)};
 }
 export function teamDetails(db:DatabaseSync,id:number,mode:TeamMode,version:string){
   return db.prepare(`SELECT config,status,result,error,elapsed FROM team_job WHERE snapshot_id=? AND rules=? AND mode=? AND version=? ORDER BY id`)
@@ -82,13 +114,18 @@ export async function processTeams(db:DatabaseSync,owner:string,mode:TeamMode){
     put(key,data){save.run(last,cacheVersion,key,gzipSync(data));}
   });
   const getSouls=db.prepare('SELECT data FROM soul WHERE snapshot_id=? ORDER BY uuid');
+  const pending=db.prepare("SELECT * FROM team_job WHERE rules=? AND version=? AND mode=? AND status='待算' AND snapshot_id=? ORDER BY id LIMIT 1");
+  const nextSnapshot=db.prepare(`SELECT snapshot_id FROM team_job WHERE rules=? AND version=? AND mode=? AND status IN ('待算','运行中')
+    GROUP BY snapshot_id HAVING count(*) FILTER (WHERE status='待算')>0
+    ORDER BY count(*) FILTER (WHERE status='运行中'),snapshot_id LIMIT 1`);
   while(true){
     const job=transaction(db,()=>{
       if(db.prepare('SELECT paused FROM team_control WHERE mode=?').get(mode)?.paused)return;
-      const row=db.prepare(`SELECT j.* FROM team_job j JOIN current_member c ON c.current_snapshot=j.snapshot_id
-        WHERE status='待算' AND rules=? AND version=? AND mode=?
-        ORDER BY (j.snapshot_id=?) DESC,
-        EXISTS(SELECT 1 FROM team_job k WHERE k.snapshot_id=j.snapshot_id AND k.status='运行中'),j.snapshot_id,j.id LIMIT 1`).get(rulesVersion,analysisVersion,mode,last);
+      let row=last?pending.get(rulesVersion,analysisVersion,mode,last):undefined;
+      if(!row){
+        const next=nextSnapshot.get(rulesVersion,analysisVersion,mode);
+        if(next)row=pending.get(rulesVersion,analysisVersion,mode,next.snapshot_id);
+      }
       if(row)db.prepare("UPDATE team_job SET status='运行中',owner=? WHERE id=?").run(owner,row.id);
       return row;
     });

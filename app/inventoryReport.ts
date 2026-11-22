@@ -6,7 +6,7 @@ import {soulSets} from './soulSets.ts';
 export const inventoryFields=['yield','输出','孔雀','季','速度','治疗','命中','防御输出'] as const;
 export type InventoryField=(typeof inventoryFields)[number];
 export const inventoryLabels:Record<InventoryField,string>={yield:'速攻暴伤收益次数',输出:'输出',孔雀:'孔雀',季:'季',速度:'速度',治疗:'治疗',命中:'命中',防御输出:'防御输出'};
-export function customYield(s:Soul){
+function customYield(s:Soul){
   return ['速度','攻击加成','暴击','暴击伤害'].reduce((n,k)=>n+Math.ceil((s.sub[k]??0)/(k==='暴击伤害'?4:3)),0);
 }
 export function effectGain(souls:Soul[],effect:'效果命中'|'效果抵抗'){

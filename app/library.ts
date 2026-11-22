@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { decode, hash, type Listing, type Soul } from './domain.ts';
 import { analysisVersion, inventoryStats, speedAnalysis, type SpeedResult, type SetStats } from './analysis.ts';
 import { pveAnalysis } from './pve.ts';
+import { backfillSusanoMeans, saveSusanoMeans } from './pveMean.ts';
 import {createInventoryTables,indexInventory} from './inventoryReport.ts';
 import {migrateInventoryRatings} from './migrateInventory.ts';
 
@@ -65,6 +66,10 @@ export function openLibrary(path = defaultDB) {
   atomic(db, () => {
     createInventoryTables(db);
     if (db.prepare("SELECT 1 FROM sqlite_schema WHERE name='piece_rating'").get()) migrateInventoryRatings(db);
+    backfillSusanoMeans(db);
+    if(db.prepare('PRAGMA user_version').get()?.user_version===1){
+      db.exec("UPDATE team_control SET paused=1; UPDATE team_job SET status='已暂停' WHERE status='待算'; PRAGMA user_version=2");
+    }
   });
   return db;
 }
@@ -95,6 +100,7 @@ export function resetLibrary(db: DatabaseSync) {
 function saveAnalysis(db: DatabaseSync, snapshot: number, stats: SetStats[], speeds: SpeedResult[]) {
   const insert = db.prepare('INSERT INTO metric VALUES(?,?,?,?,?,?)');
   for (const m of speeds) insert.run(snapshot, analysisVersion, m.key, m.name, m.value, JSON.stringify(m.ids));
+  saveSusanoMeans(db,'pve/',snapshot,analysisVersion);
   db.prepare('INSERT INTO analysis VALUES(?,?,?)').run(snapshot, analysisVersion, JSON.stringify(stats));
 }
 function writeListing(db: DatabaseSync, data: Listing, raw: Buffer, digest: string) {
@@ -122,17 +128,16 @@ export interface ImportReport {
   added: number; updated: number; duplicates: number; calculated: number; batch: number;
   errors: {file: string; message: string}[];
 }
-export function scan(db: DatabaseSync, dir = defaultDir, progress?: (value: string) => void): ImportReport {
-  // A reset from another process invalidates work started against the previous library.
-  const generation = db.prepare('SELECT generation FROM library_state WHERE id=1');
-  const started = generation.get()!.generation;
-  const interrupted = new Error('账号库已清空，本次扫描已停止');
-  function write<T>(fn: () => T): T {
-    return atomic(db, () => {
-      if (generation.get()!.generation !== started) throw interrupted;
-      return fn();
-    });
-  }
+class LibraryReset extends Error {}
+function writeAtGeneration<T>(db:DatabaseSync,epoch:number,fn:()=>T) {
+  return atomic(db,()=>{
+    if(db.prepare('SELECT generation FROM library_state WHERE id=1').get()!.generation!==epoch)
+      throw new LibraryReset('账号库已清空，本次扫描已停止');
+    return fn();
+  });
+}
+export function scanSources(db: DatabaseSync, dir = defaultDir, progress?: (value: string) => void) {
+  const epoch=Number(db.prepare('SELECT generation FROM library_state WHERE id=1').get()!.generation);
   const report: ImportReport = { added:0, updated:0, duplicates:0, calculated:0, batch:0, errors:[] };
   const files = readdirSync(dir,{withFileTypes:true}).filter(f=>f.isFile() && /\.json$/i.test(f.name)).map(f=>f.name).sort();
   const known = db.prepare('SELECT 1 FROM source WHERE hash=?');
@@ -145,31 +150,49 @@ export function scan(db: DatabaseSync, dir = defaultDir, progress?: (value: stri
         continue; // Reference exports are read only by the comparison CLI.
       }
       const data = decode(raw,statSync(path).mtimeMs);
-      const result = write(() => known.get(digest) ? 'duplicates' : writeListing(db,data,raw,digest));
+      const result = writeAtGeneration(db,epoch,() => known.get(digest) ? 'duplicates' : writeListing(db,data,raw,digest));
       report[result]++;
-    } catch (e) { if (e === interrupted) throw e; report.errors.push({file,message: e instanceof Error ? e.message : String(e)}); }
+    } catch (e) { if (e instanceof LibraryReset) throw e; report.errors.push({file,message: e instanceof Error ? e.message : String(e)}); }
   }
   // Persist membership before computing: after interruption, the missing analysis rows resume on rescan.
-  report.batch = write(() => {
+  report.batch = writeAtGeneration(db,epoch,() => {
     const id = Number(db.prepare('INSERT INTO batch(version) VALUES(?)').run(analysisVersion).lastInsertRowid);
     db.prepare('INSERT INTO member SELECT ?,account_key,current_snapshot,name,server_name,url,price FROM current_member').run(id);
     return id;
   });
   const missing = db.prepare(`SELECT DISTINCT m.snapshot_id FROM member m LEFT JOIN analysis a
     ON a.snapshot_id=m.snapshot_id AND a.version=? WHERE m.batch_id=? AND a.snapshot_id IS NULL`).all(analysisVersion,report.batch);
-  for (const [index,row] of missing.entries()) {
-    const snapshot = Number(row.snapshot_id);
-    progress?.(`计算库存、一速和 PVE 预设 ${index+1}/${missing.length}`);
-    try {
-      const souls: Soul[] = db.prepare('SELECT data FROM soul WHERE snapshot_id=? ORDER BY uuid').all(snapshot).map(r=>JSON.parse(String(r.data)));
-      const stats = inventoryStats(souls), speeds = [...speedAnalysis(souls),...pveAnalysis(souls)];
-      if (write(() => {
-        if (db.prepare('SELECT 1 FROM analysis WHERE snapshot_id=? AND version=?').get(snapshot,analysisVersion)) return false;
-        saveAnalysis(db,snapshot,stats,speeds); return true;
-      })) report.calculated++;
-    } catch (e) { if (e === interrupted) throw e; report.errors.push({file:'快照 '+snapshot,message:e instanceof Error ? e.message : String(e)}); }
+  return {report,epoch,ids:missing.map(row=>Number(row.snapshot_id))};
+}
+
+export function analyzeSnapshot(db:DatabaseSync,snapshot:number,epoch:number) {
+  try {
+    const souls: Soul[] = db.prepare('SELECT data FROM soul WHERE snapshot_id=? ORDER BY uuid').all(snapshot).map(r=>JSON.parse(String(r.data)));
+    const stats = inventoryStats(souls), speeds = [...speedAnalysis(souls),...pveAnalysis(souls)];
+    const calculated=writeAtGeneration(db,epoch,()=>{
+      if (db.prepare('SELECT 1 FROM analysis WHERE snapshot_id=? AND version=?').get(snapshot,analysisVersion)) return 0;
+      saveAnalysis(db,snapshot,stats,speeds); return 1;
+    });
+    return {calculated};
+  } catch(e) {
+    if(e instanceof LibraryReset)throw e;
+    return {calculated:0,error:{file:'快照 '+snapshot,message:e instanceof Error?e.message:String(e)}};
   }
+}
+
+export function indexPending(db:DatabaseSync,epoch:number) {
   const unindexed=db.prepare('SELECT s.id FROM snapshot s JOIN analysis a ON a.snapshot_id=s.id AND a.version=? LEFT JOIN inventory_ready r ON r.snapshot_id=s.id WHERE r.snapshot_id IS NULL').all(analysisVersion);
-  for(const row of unindexed)write(()=>indexInventory(db,Number(row.id)));
+  for(const row of unindexed)writeAtGeneration(db,epoch,()=>indexInventory(db,Number(row.id)));
+}
+
+export function scan(db: DatabaseSync, dir = defaultDir, progress?: (value: string) => void): ImportReport {
+  const {report,epoch,ids}=scanSources(db,dir,progress);
+  for(const [i,id] of ids.entries()){
+    progress?.(`计算库存、一速和 PVE 预设 ${i+1}/${ids.length}`);
+    const result=analyzeSnapshot(db,id,epoch);
+    report.calculated+=result.calculated;
+    if(result.error)report.errors.push(result.error);
+  }
+  indexPending(db,epoch);
   return report;
 }

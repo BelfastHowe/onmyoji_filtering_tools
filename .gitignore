@@ -3,10 +3,15 @@ dist/
 local_data/
 /account_data/*
 !/account_data/.gitkeep
+cbg~*.json
+ref-*.json
+ref-*.json.*.part
 *.sqlite
+*.sqlite-journal
 *.sqlite-wal
 *.sqlite-shm
 *.log
+*.cpuprofile
 .env
 .env.*
 !.env.example
