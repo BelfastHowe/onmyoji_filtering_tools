@@ -1,7 +1,8 @@
 node_modules/
 dist/
 local_data/
-account_data/
+/account_data/*
+!/account_data/.gitkeep
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
