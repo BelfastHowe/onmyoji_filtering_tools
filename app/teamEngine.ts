@@ -94,7 +94,10 @@ export function createTeamEngine(originalWorker=false,cache?:{get:(key:string)=>
   // Evaluate a fresh catalogue for each template: the reference engine resolves
   // teammate-dependent functions into numbers and mutates that working template.
   const imports=bindings(teams.slice(0,teams.indexOf('const ss=')));
-  const definitions='const '+portion(teams,'P={ref0a:',',on={class:"wrapper"}')+';';
+  // Tamamo attacks a fresh Boat1 in the Sea P2 precheck. The pinned calculator
+  // also inspects two-piece sets and expects an HP ratio if it encounters 心眼.
+  const definitions='const '+portion(teams,'P={ref0a:',',on={class:"wrapper"}')
+    .replace('vt(e,n,u,t,h,c.Boat1,x,D)','vt(e,n,u,t,h,c.Boat1,x,[...D,{type:m.剩余生命比例,value:1}])')+';';
   const execute=portion(teams,'const D=async()=>',';return(f,_)').replace('ct.optimal=!0,Q[M]','ct.chosenForTeam=true,ct.optimal=!0,Q[M]');
   load(`const createScenario=()=>{`+imports+definitions+`
     return {list:()=>Object.entries(Ft).flatMap(([scene,group])=>group.teams.map((a,index)=>({
