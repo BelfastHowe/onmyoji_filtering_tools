@@ -8,6 +8,7 @@ import { pveAnalysis } from './pve.ts';
 import { backfillSusanoMeans, saveSusanoMeans } from './pveMean.ts';
 import {createInventoryTables,indexInventory} from './inventoryReport.ts';
 import {migrateInventoryRatings} from './migrateInventory.ts';
+import {invalidateOldDamageResults} from './damageSets.ts';
 
 export const defaultDir = resolve(import.meta.dirname, '../account_data');
 export const defaultDB = resolve(import.meta.dirname, '../local_data/accounts.sqlite');
@@ -69,6 +70,10 @@ export function openLibrary(path = defaultDB) {
     backfillSusanoMeans(db);
     if(db.prepare('PRAGMA user_version').get()?.user_version===1){
       db.exec("UPDATE team_control SET paused=1; UPDATE team_job SET status='已暂停' WHERE status='待算'; PRAGMA user_version=2");
+    }
+    if(db.prepare('PRAGMA user_version').get()?.user_version===2){
+      invalidateOldDamageResults(db);
+      db.exec('PRAGMA user_version=3');
     }
   });
   return db;

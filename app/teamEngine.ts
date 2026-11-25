@@ -3,6 +3,7 @@ import {ruleText} from './rules.ts';
 import type {Soul} from './domain.ts';
 import {linearPartitions} from './linearPreview.ts';
 import {optimizeWorker} from './workerSearch.ts';
+import {applyDamageSetRules} from './damageSets.ts';
 import {createHash} from 'node:crypto';
 
 const types:Record<string,string>={攻击:'Attack',速度:'Speed',生命:'Hp',防御:'Defense',暴击:'CritRate',暴击伤害:'CritPower',攻击加成:'AttackRate',生命加成:'HpRate',防御加成:'DefenseRate',效果命中:'EffectHitRate',效果抵抗:'EffectResistRate'};
@@ -83,9 +84,12 @@ export function createTeamEngine(originalWorker=false,cache?:{get:(key:string)=>
       const fields=names.split(',').map(field=>{const [local,exported]=field.split(' as ');return (exported??local)+':'+local;});
       return 'return {'+fields.join(',')+'};';
     });
-    if(name==='calculator-70eebf65.js'&&!originalWorker){
-      load('const linearPartitions='+linearPartitions.toString());
-      source=source.replace('v=nt(k,u,t,e)','v=linearPartitions(k,ge(u),t,e,singleSuitBonus)??nt(k,u,t,e)');
+    if(name==='calculator-70eebf65.js'){
+      source=applyDamageSetRules(source);
+      if(!originalWorker){
+        load('const linearPartitions='+linearPartitions.toString());
+        source=source.replace('v=nt(k,u,t,e)','v=linearPartitions(k,ge(u),t,e,singleSuitBonus)??nt(k,u,t,e)');
+      }
     }
     load('modules.'+name.split('-')[0]+'=(()=>{'+source+'})();');
   }
@@ -94,10 +98,7 @@ export function createTeamEngine(originalWorker=false,cache?:{get:(key:string)=>
   // Evaluate a fresh catalogue for each template: the reference engine resolves
   // teammate-dependent functions into numbers and mutates that working template.
   const imports=bindings(teams.slice(0,teams.indexOf('const ss=')));
-  // Tamamo attacks a fresh Boat1 in the Sea P2 precheck. The pinned calculator
-  // also inspects two-piece sets and expects an HP ratio if it encounters 心眼.
-  const definitions='const '+portion(teams,'P={ref0a:',',on={class:"wrapper"}')
-    .replace('vt(e,n,u,t,h,c.Boat1,x,D)','vt(e,n,u,t,h,c.Boat1,x,[...D,{type:m.剩余生命比例,value:1}])')+';';
+  const definitions='const '+portion(teams,'P={ref0a:',',on={class:"wrapper"}')+';';
   const execute=portion(teams,'const D=async()=>',';return(f,_)').replace('ct.optimal=!0,Q[M]','ct.chosenForTeam=true,ct.optimal=!0,Q[M]');
   load(`const createScenario=()=>{`+imports+definitions+`
     return {list:()=>Object.entries(Ft).flatMap(([scene,group])=>group.teams.map((a,index)=>({

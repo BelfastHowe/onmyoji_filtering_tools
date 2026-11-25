@@ -14,7 +14,7 @@ import {fillQuickPreviews} from '../app/previewJobs.ts';
 import {backfillSusanoMeans} from '../app/pveMean.ts';
 import {fourSets,bossSets} from '../app/pve.ts';
 import {inventoryReport} from '../app/inventoryReport.ts';
-import {rulesDir,ruleFiles} from '../app/rules.ts';
+import {rulesDir,ruleFiles,rulesVersion} from '../app/rules.ts';
 import {existsSync} from 'node:fs';
 import {Worker} from 'node:worker_threads';
 
@@ -35,6 +35,26 @@ function fixture(t) {
   function write(file, value){writeFileSync(join(dir,file+'.json'),JSON.stringify(value));}
   return {db,dir,write};
 }
+
+test('damage migration invalidates affected candidates and their scene total, retaining independent results',t=>{
+  const dir=mkdtempSync(join(tmpdir(),'cbg-damage-')),file=join(dir,'old.db');
+  let db=openLibrary(file);
+  t.after(()=>{db.close();rmSync(dir,{recursive:true,force:true});});
+  const doc=account();
+  for(const id of ['1-0','2-0'])Object.assign(doc.equip.equip_desc.inventory[id],{name:'心眼',suitid:300022});
+  writeFileSync(join(dir,'a.json'),JSON.stringify(doc));scan(db,dir);
+  const prefix='team/'+rulesVersion+'/严格快速/魂土/';
+  const job=db.prepare("INSERT INTO team_job(snapshot_id,rules,version,mode,scene,template,config,status,result) VALUES(1,?,?,'严格快速','魂土',?,'{}','完成',?)");
+  const metric=db.prepare("INSERT INTO metric VALUES(1,?,?,?,1,'[]')");
+  for(const [index,ids] of [['1-0','2-0'],['1-0','2-1']].entries()){
+    job.run(rulesVersion,analysisVersion,index,JSON.stringify({members:[{ids,chosen:false}]}));
+    for(const suffix of ['', '/owned'])metric.run(analysisVersion,prefix+index+suffix,'test');
+  }
+  metric.run(analysisVersion,prefix+'count','test');
+  db.exec('PRAGMA user_version=2');db.close();db=openLibrary(file);
+  assert.deepEqual(db.prepare('SELECT status FROM team_job ORDER BY template').all().map(r=>r.status),['已暂停','完成']);
+  assert.deepEqual(db.prepare("SELECT key FROM metric WHERE key LIKE 'team/%' ORDER BY key").all().map(r=>r.key),[prefix+'1',prefix+'1/owned']);
+});
 
 test('Susano means use 21 exact presets per mode and version; historical rankings and range filters use the stored mean',t=>{
   const {db,dir,write}=fixture(t);

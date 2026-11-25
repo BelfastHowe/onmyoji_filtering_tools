@@ -6,8 +6,34 @@ import {join} from 'node:path';
 import {ruleFiles,ruleText,rulesDir} from '../app/rules.ts';
 import {createTeamEngine} from '../app/teamEngine.ts';
 import {optimizeWorker} from '../app/workerSearch.ts';
+import {applyDamageSetRules} from '../app/damageSets.ts';
+import {soulSets} from '../app/soulSets.ts';
 
 const workerFile='calculatorWorker-309b3933.js';
+test('damage uses four ordinary pieces and two boss pieces; panel sets retain their two-piece threshold',
+  {skip:![workerFile,'calculator-70eebf65.js'].every(f=>existsSync(join(rulesDir,f)))},()=>{
+    const code=applyDamageSetRules(ruleText('calculator-70eebf65.js'));
+    const ctx=createContext({ee:id=>soulSets[id].name});
+    runInContext('globalThis.self=globalThis;globalThis.onmessage=null;'+ruleText(workerFile).replace('var lt=On.exports','globalThis.f=On.exports;var lt=On.exports'),ctx);
+    const defs=code.slice(code.indexOf('damagePieces=id=>'),code.indexOf(',gt=u=>'));
+    const factors=code.slice(code.indexOf('Q=(u,t,e)=>{const n=Ee('),code.indexOf(',Z=(u,t)=>'));
+    const {actual,planned,panel}=runInContext(`const b={剩余生命比例:'remainingHpRatio'},${defs},${factors};
+      ({actual:Q,planned:(groups,hit,extras)=>ue(_e(groups),hit,extras),panel:Ee})`,ctx);
+    function check(groups,hp,expected){
+      const extras=hp==null?[]:[{type:'remainingHpRatio',value:hp}];
+      const gear=groups.flatMap(({id,count})=>Array.from({length:count},()=>({suit_id:id})));
+      for(const value of [actual(gear,0,extras),planned(groups,0,extras)])assert.ok(Math.abs(value-expected)<1e-10);
+    }
+    const eye=count=>({id:300022,count});
+    assert.ok(panel([{suit_id:300022},{suit_id:300022}]).includes('心眼'));
+    for(const count of [2,3])for(const hp of [undefined,1,.55,0])check([eye(count)],hp,1);
+    for(const count of [4,5,6]){
+      for(const [hp,factor] of [[undefined,1],[1,1],[.851,1],[.85,1.1],[.55,1.3],[0,1.6]])check([eye(count)],hp,factor);
+    }
+    check([eye(4),{id:300030,count:2}],.55,1.3);
+    check([eye(2),{id:300030,count:4}],.55,1.4);
+    check([eye(4),{id:300052,count:2}],.55,1.3*1.1);
+  });
 test('Sea P2 checks Tamamo against a full-health first wave with two pieces of Mind’s Eye',
   {skip:Object.keys(ruleFiles).some(file=>!existsSync(join(rulesDir,file)))},async()=>{
     const gear=[];
